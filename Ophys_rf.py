@@ -9,60 +9,103 @@ from allensdk.brain_observatory.locally_sparse_noise import LocallySparseNoise
 manifest_file = '../../../data/allen-brain-observatory/visual-coding-2p/manifest.json'
 boc = BrainObservatoryCache(manifest_file=manifest_file)
 
-# Step 1: Query all experiments matching VISp, LSN stimulus, imaging depth 300–550 um
-experiments = boc.get_ophys_experiments(
+# Load the cell specimen table for filtering
+cell_specimen_table = pd.DataFrame(boc.get_cell_specimens())
+
+# Filter for VISp and imaging depth between 300 and 550 um
+exps = boc.get_ophys_experiments(
     targeted_structures=['VISp'],
+    imaging_depths=[300, 350, 400, 450, 500, 550],
     stimuli=['locally_sparse_noise'],
 )
+if len(exps) == 0:
+    raise RuntimeError("No experiments found")
 
-filtered_experiments = [exp for exp in experiments if 300 <= exp['imaging_depth'] <= 550]
+# Choose the first matching experiment
+exp = exps[0]
+session_id = exp['id']
+cre_line = exp['cre_line']
+depth = exp['imaging_depth']
+print(f"Session {session_id}, Cre-line: {cre_line}, Depth: {depth}µm (VISp)")
 
-# Selecting the first matching experiment for now
-experiment = filtered_experiments[0]
-print(f"Using experiment ID: {experiment['id']}")
-print(f"Cre line: {experiment['cre_line']}")
-print(f"Imaging depth: {experiment['imaging_depth']} µm")
+# Load the dataset
+dset = boc.get_ophys_experiment_data(ophys_experiment_id=session_id)
+ts, dff = dset.get_dff_traces()
+cell_ids = dset.get_cell_specimen_ids()
 
-# Step 2: Load experiment data
-data_set = boc.get_ophys_experiment_data(experiment['id'])
+lsn_table = dset.get_stimulus_table('locally_sparse_noise')
+starts = lsn_table.start.values
+ends = lsn_table.end.values
+frames = lsn_table.frame.values
 
-# Step 3: Use LocallySparseNoise analysis class
-lsn = LocallySparseNoise(data_set)
 
-# Get receptive field maps for all cells
-receptive_fields = lsn.receptive_field
+# Build receptive field map
+templ = dset.get_stimulus_template('locally_sparse_noise')
 
-# Step 4: Visualize the receptive field map of a single cell
-num_cells = receptive_fields.shape[0]
-print(f"Number of cells: {num_cells}")
+H, W = templ.shape[1], templ.shape[2]
+n_cells = dff.shape[0]
+rf_maps = np.zeros((H, W, n_cells))
+print(H)
+print(W)
 
-# Plot the first 10 valid receptive fields
-num_to_plot = 10
-plotted = 0
-for cell_index in range(num_cells):
-    if plotted >= num_to_plot:
-        break
+#stim_duration_sec = lsn_table["end"].iloc[0] - lsn_table["start"].iloc[0]
 
-    rf = receptive_fields[cell_index]  # Shape: (2, H, W)
+#print(lsn_table.head)
+#frame_rate = lsn_table["frame"].iloc[0]
+#window_duration = int(np.round(stim_duration_sec * frame_rate))
+window_duration = lsn_table["end"].iloc[0] - lsn_table["start"].iloc[0]
 
-    # Skip empty or invalid RFs
-    if rf is None or np.all(np.isnan(rf)):
-        print(f"Skipping cell {cell_index}: RF is empty or invalid.")
-        continue
+print(f"Window duration (frames): {window_duration}")
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+print("max frame index:", np.max(frames))
+print("min frame index:", np.min(frames))
+print(f"H*W = {H*W}")
 
-    # ON field
-    axs[0].imshow(rf[0], cmap='hot', interpolation='nearest')
-    axs[0].set_title(f"Cell {cell_index} - ON Receptive Field")
-    axs[0].axis('off')
+print(len(frames))
 
-    # OFF field
-    axs[1].imshow(rf[1], cmap='hot', interpolation='nearest')
-    axs[1].set_title(f"Cell {cell_index} - OFF Receptive Field")
-    axs[1].axis('off')
+for trial_idx, frm in enumerate(frames):
+    # stimulus at this frame: shape (H, W)
+    stim_frame = templ[frm, :, :]  # 16 x 28
 
-    plt.suptitle(f"Receptive Fields - Cell {cell_index}", fontsize=14)
-    plt.tight_layout()
-    plt.show()
-    plotted += 1
+    s = starts[trial_idx]
+    e = s + window_duration
+
+    # average cell response in response window
+    slice_resp = dff[:, s:e].mean(axis=1)  # n_cells
+
+    # For all pixels in this frame that are ON
+    on_pixels = np.argwhere(stim_frame != 0)
+
+    for (y, x) in on_pixels:
+        rf_maps[y, x, :] += slice_resp
+
+
+# Normalize each RF map across space
+rf_maps_mean = rf_maps.mean(axis=(0, 1))
+rf_maps_std = rf_maps.std(axis=(0, 1))
+rf_maps_std[rf_maps_std == 0] = 1e-6  # avoid division by zero
+
+rf_maps -= rf_maps_mean
+rf_maps /= rf_maps_std
+
+# Plot example RFs
+n_plot = min(16, n_cells)
+fig, axes = plt.subplots(4, 4, figsize=(10, 10))
+axes = axes.flatten()
+
+# Store last imshow result for colorbar
+for i in range(n_plot):
+    im = axes[i].imshow(rf_maps[:, :, i], cmap='RdBu_r', origin='lower', vmin=-2, vmax=2)
+    axes[i].set_title(f"Cell {cell_ids[i]}")
+    axes[i].axis('off')
+
+# Adjust space to make room for colorbar
+fig.subplots_adjust(right=0.85)
+
+# Create new axis for colorbar
+cbar_ax = fig.add_axes([0.87, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+fig.colorbar(im, cax=cbar_ax)
+
+plt.suptitle(f"Receptive Fields (VISp) - {cre_line} @ {depth}µm", y=1.02)
+plt.tight_layout(rect=[0, 0, 0.85, 1])
+plt.show()
